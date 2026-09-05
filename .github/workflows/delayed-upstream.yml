@@ -1,0 +1,81 @@
+name: Delayed upstream master sync
+
+on:
+  schedule:
+    - cron: "0 14 * * *"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: delayed-upstream-master
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPOSITORY: https://github.com/fa0311/TwitterInternalAPIDocument.git
+  UPSTREAM_BRANCH: master
+  TARGET_BRANCH: master
+  DELAY_DAYS: "30"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select delayed upstream commit
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add upstream "$UPSTREAM_REPOSITORY"
+          git fetch --no-tags --prune --force upstream \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          cutoff="$(date -u -d "${DELAY_DAYS} days ago" '+%Y-%m-%dT%H:%M:%SZ')"
+          target="$(git rev-list --first-parent --before="$cutoff" -n 1 \
+            "refs/remotes/upstream/${UPSTREAM_BRANCH}")"
+
+          if [[ -z "$target" ]]; then
+            echo "No upstream commit is old enough for the ${DELAY_DAYS}-day delay." >&2
+            exit 1
+          fi
+
+          commit_date="$(git show -s --format='%cI' "$target")"
+          echo "sha=$target" >> "$GITHUB_OUTPUT"
+          echo "cutoff=$cutoff" >> "$GITHUB_OUTPUT"
+          echo "commit_date=$commit_date" >> "$GITHUB_OUTPUT"
+          echo "Using upstream commit $target ($commit_date), cutoff $cutoff"
+
+      - name: Replace fork master with delayed snapshot
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+          TARGET_BRANCH: ${{ env.TARGET_BRANCH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          workflow_backup="$(mktemp)"
+          trap 'rm -f "$workflow_backup"' EXIT
+          cp .github/workflows/delayed-upstream.yml "$workflow_backup"
+
+          # Force-follow upstream, including non-fast-forward history rewrites.
+          git checkout --detach "$TARGET_SHA"
+
+          # Keep the scheduler alive after resetting the default branch.
+          mkdir -p .github/workflows
+          cp "$workflow_backup" .github/workflows/delayed-upstream.yml
+          git add .github/workflows/delayed-upstream.yml
+          if ! git diff --cached --quiet; then
+            git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "chore: keep delayed upstream sync workflow"
+          fi
+
+          git push --force origin "HEAD:refs/heads/${TARGET_BRANCH}"
